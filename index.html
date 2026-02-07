@@ -1,0 +1,1108 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Linuxサーバー診断コマンド集</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    @keyframes flow { 0% { transform: translateX(0); } 100% { transform: translateX(calc(100% + 100vw)); } }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.7; transform: scale(1.05); } }
+    @keyframes pulse-custom { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.6; transform: scale(0.95); } }
+    .animate-spin-slow { animation: spin 3s linear infinite; }
+    .animate-spin-slower { animation: spin 4s linear infinite; }
+    .animate-flow { animation: flow 2s linear infinite; }
+    .animate-blink { animation: blink 1.5s ease-in-out infinite; }
+    .animate-pulse-custom { animation: pulse-custom 2s ease-in-out infinite; }
+    
+    /* モバイル横向き時は左右分割 */
+    @media (orientation: landscape) and (max-width: 1023px) {
+      .mobile-layout {
+        display: grid !important;
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+      }
+      .mobile-layout > div {
+        flex: none !important;
+      }
+    }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-indigo-500 to-purple-600 min-h-screen">
+  <div class="min-h-screen flex flex-col p-2 sm:p-2.5 gap-2">
+    <header class="bg-white px-4 py-2 rounded-md shadow-lg text-center">
+      <h1 class="text-indigo-500 text-base sm:text-lg font-bold">🖥️ Linuxサーバー診断コマンド集</h1>
+    </header>
+
+    <div class="mobile-layout flex flex-col lg:grid lg:grid-cols-2 gap-2 h-[calc(100vh-5rem)]">
+      <div class="bg-white rounded-lg p-2 sm:p-2.5 shadow-xl overflow-y-auto flex-1 lg:h-auto">
+        <div id="diagram" class="flex flex-wrap gap-2 sm:gap-2.5 content-start"></div>
+      </div>
+
+      <div id="panel" class="bg-white rounded-lg p-3 sm:p-4 shadow-xl overflow-y-auto flex-1 lg:h-auto">
+        <div class="text-center text-gray-400 py-10">
+          <div class="text-4xl mb-3 opacity-50">👈</div>
+          <div>左側の診断項目を<br>クリックしてください</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ========================================
+    // 定数定義
+    // ========================================
+    const THRESHOLDS = {
+      DISK_WARNING: 50,
+      DISK_DANGER: 80,
+      MEMORY_WARNING: 60,
+      MEMORY_CHIP_STEP: 20
+    };
+
+    const ANIMATION = {
+      COPY_BUTTON_RESET_MS: 1500,
+      UPDATE_INTERVAL_MS: 3000
+    };
+
+    // ========================================
+    // データ生成（デモ用ランダム値）
+    // ========================================
+    const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    const cpuCore0 = rand(30, 95);
+    const cpuCore1 = rand(30, 95);
+    const memUsed = (Math.random() * 6 + 8).toFixed(1);
+    const memTotal = 16;
+    const memPercent = Math.round((memUsed / memTotal) * 100);
+    const diskRoot = rand(55, 65);
+    const diskHome = rand(65, 80);
+    const diskVarLog = rand(55, 70);
+    const diskTmp = rand(80, 95);
+    const diskSwap = rand(10, 40);
+
+    const data = [
+      { title: 'CPU負荷', cat: 'ロードアベレージ', cmds: [
+        { cmd: 'uptime', desc: 'システムの負荷状況を瞬時に確認。CPU数と比較してロードアベレージが大きい場合、処理待ちが発生している', 
+          options: [
+            { opt: '(オプションなし)', desc: '稼働時間、ユーザー数、ロードアベレージを表示' },
+            { opt: '-p', desc: '見やすいフォーマットで稼働時間のみ表示' },
+            { opt: '-s', desc: 'システム起動時刻のみ表示' }
+          ],
+          ex: '$ uptime\n 18:36:50 up 50 min, 1 user, load average: 0.19, 0.17, 0.13' },
+        { cmd: 'cat /proc/loadavg', desc: 'uptimeより詳細な負荷情報を取得。実行中/実行可能プロセス数も確認でき、負荷の推移傾向を把握できる', 
+          options: [
+            { opt: '/proc/loadavg', desc: 'カーネルが提供するロード情報ファイル' },
+            { opt: '1番目', desc: '1分間の平均ロード' },
+            { opt: '2番目', desc: '5分間の平均ロード' },
+            { opt: '3番目', desc: '15分間の平均ロード' },
+            { opt: '4番目', desc: '実行中/総プロセス数' }
+          ],
+          ex: `$ cat /proc/loadavg\n${(cpuCore0/50).toFixed(2)} ${(cpuCore1/50).toFixed(2)} ${((cpuCore0+cpuCore1)/120).toFixed(2)} 4/284 9206` },
+        { cmd: 'w', desc: 'ログイン中のユーザーと負荷状況を一覧表示。不審なアクセスや作業中ユーザーによる負荷を特定できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ユーザーの情報とuptimeを表示' },
+            { opt: '-h', desc: 'ヘッダーを表示しない' },
+            { opt: '-s', desc: '簡易フォーマット(ログイン時刻とCPU時間を省略)' },
+            { opt: '-f', desc: 'FROMフィールドを表示しない' },
+            { opt: '-i', desc: 'IPアドレスを表示' }
+          ],
+          ex: '$ w\n 18:36:50 up 50 min, 1 user, load average: 0.19, 0.17, 0.13\nUSER     TTY      LOGIN@   IDLE   WHAT\nuser     pts/1    17:42   54:10   -bash' }
+      ]},
+      { title: 'CPU使用率', cat: 'system/user/idle使用率', cmds: [
+        { cmd: 'top -bn1 | grep "Cpu(s)"', desc: 'CPU使用率を素早く把握。us(ユーザー)とsy(システム)の内訳から負荷の性質を判断でき、スクリプト化にも適している', 
+          options: [
+            { opt: '(オプションなし)', desc: '対話モードで継続的に更新表示' },
+            { opt: '-b', desc: 'バッチモード(対話式でなく1回だけ出力)' },
+            { opt: '-n1', desc: '表示回数1回で終了' },
+            { opt: '-p PID', desc: '特定PIDのみ表示' },
+            { opt: '-u USER', desc: '特定ユーザーのプロセスのみ表示' }
+          ],
+          ex: `$ top -bn1 | grep "Cpu(s)"\n%Cpu(s): ${cpuCore0}.0 us,  7.2 sy,  0.0 ni, ${100-cpuCore0-7}.2 id,  1.4 wa,  0.0 hi,  2.9 si,  0.0 st` },
+        { cmd: 'htop', desc: '対話的なプロセスビューア。カラフルな表示で視認性が高く、マウス操作やキーボードショートカットで直感的に操作できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'CPU/メモリ/スワップのグラフと全プロセスを表示' },
+            { opt: '-d N', desc: '更新間隔をN/10秒に設定' },
+            { opt: '-u USER', desc: '特定ユーザーのプロセスのみ' },
+            { opt: '-p PID,PID', desc: '特定のPIDのみ表示' },
+            { opt: '-t', desc: 'ツリー表示モードで起動' }
+          ],
+          ex: '$ htop\n(対話的な画面が表示される)' },
+        { cmd: 'mpstat 1 5', desc: 'CPU使用率の時系列変化を観察。瞬間的なスパイクか継続的な高負荷かを判断でき、各CPUコアのバランスも確認できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '全CPU平均を表示' },
+            { opt: '1', desc: 'サンプリング間隔(秒)' },
+            { opt: '5', desc: 'サンプリング回数' },
+            { opt: '-P ALL', desc: '全CPUコア個別に表示' },
+            { opt: '-P 0', desc: '特定CPUコアのみ表示' }
+          ],
+          ex: '$ mpstat 1 3\nLinux 6.6.87.2-microsoft-standard-WSL2 (linux-server)        02/07/26        _x86_64_        (6 CPU)\n18:58:48     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle\n18:58:49     all    0.00    0.00    0.50    0.00    0.00    0.00    0.00    0.00    0.00   99.50' },
+        { cmd: 'sar -u 1 10', desc: 'システムパフォーマンスの履歴データを記録し後から分析可能。統計情報を自動的に保存できる', 
+          options: [
+            { opt: '-u', desc: 'CPU使用率を表示(オプションなし)' },
+            { opt: '-r', desc: 'メモリ使用率を表示' },
+            { opt: '-d', desc: 'ディスクI/Oを表示' },
+            { opt: '-n DEV', desc: 'ネットワーク統計を表示' },
+            { opt: '1 10', desc: '1秒間隔10回サンプリング' }
+          ],
+          ex: '$ sar -u 1 3\nLinux 6.6.87.2-microsoft-standard-WSL2 (linux-server)        02/07/26        _x86_64_        (6 CPU)\n18:58:42        CPU     %user     %nice   %system   %iowait    %steal     %idle\n18:58:43        all      0.17      0.00      0.00      0.00      0.00     99.83\n18:58:44        all      0.33      0.00      0.33      0.00      0.00     99.34\n18:58:45        all      0.83      0.00      2.50      0.00      0.00     96.66\nAverage:        all      0.44      0.00      0.94      0.00      0.00     98.61' },
+        { cmd: 'ps aux --sort=-%cpu | head -15', desc: 'CPU負荷の原因プロセスを特定し、調査や対処（最適化、再起動、停止）の判断に活用', 
+          options: [
+            { opt: '(オプションなし)', desc: 'プロセス起動順で表示' },
+            { opt: 'a', desc: '全ユーザーのプロセスを表示' },
+            { opt: 'u', desc: 'ユーザー向け詳細情報表示' },
+            { opt: 'x', desc: '端末に紐づかないプロセスも表示' },
+            { opt: '--sort=-%cpu', desc: 'CPU使用率降順でソート' }
+          ],
+          ex: '$ ps aux --sort=-%cpu | head -15\nUSER         PID %CPU %MEM    VSZ   RSS COMMAND\nroot           1  0.0  0.3  21840 12488 /sbin/init\nroot          44  0.0  0.4  66820 16568 systemd-journald' }
+      ]},
+      { title: 'メモリ', cat: '使用率/使用量/容量', cmds: [
+        { cmd: 'free -h', desc: 'メモリ不足の兆候（available領域の減少）を検出し、OOMキラーによるプロセス強制終了を防ぐ。キャッシュとバッファを含む実態を把握できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'キロバイト単位で表示' },
+            { opt: '-h', desc: '人間が読みやすい形式(KB/MB/GB)' },
+            { opt: '-m', desc: 'MB単位で表示' },
+            { opt: '-g', desc: 'GB単位で表示' },
+            { opt: '-s N', desc: 'N秒毎に繰り返し表示' }
+          ],
+          ex: `$ free -h\n               total        used        free      shared  buff/cache   available\nMem:        ${(memTotal+'Gi').padStart(8)} ${(memUsed+'Gi').padStart(11)} ${((memTotal-memUsed-0.2).toFixed(1)+'Gi').padStart(11)} ${'3.4Mi'.padStart(11)} ${'223Mi'.padStart(13)} ${((memTotal-memUsed+0.1).toFixed(1)+'Gi').padStart(11)}\nSwap:       ${'1.0Gi'.padStart(8)} ${'0B'.padStart(11)} ${'1.0Gi'.padStart(11)}` },
+        { cmd: 'free -m', desc: 'スクリプトでメモリ使用量を監視し、閾値超過時にアラートを出す。MB単位で正確な数値比較が可能', 
+          options: [
+            { opt: '-m', desc: 'MB単位で表示' },
+            { opt: '-b', desc: 'バイト単位で表示' },
+            { opt: '-k', desc: 'KB単位で表示' },
+            { opt: '-t', desc: '合計行を追加' }
+          ],
+          ex: `$ free -m\n               total        used        free      shared  buff/cache   available\nMem:        ${String(memTotal*1024).padStart(8)} ${String(Math.round(memUsed*1024)).padStart(11)} ${String(Math.round((memTotal-memUsed-0.2)*1024)).padStart(11)} ${'3'.padStart(11)} ${'223'.padStart(13)} ${String(Math.round((memTotal-memUsed+0.1)*1024)).padStart(11)}\nSwap:       ${'1024'.padStart(8)} ${'0'.padStart(11)} ${'1024'.padStart(11)}` },
+        { cmd: 'ps aux --sort=-%mem | head -15', desc: 'メモリリークやメモリを大量消費しているプロセスを特定し、再起動やチューニングの対象を判断', 
+          options: [
+            { opt: '(オプションなし)', desc: 'プロセス起動順で表示' },
+            { opt: 'a', desc: '全ユーザーのプロセス' },
+            { opt: 'u', desc: 'ユーザー向け詳細表示' },
+            { opt: 'x', desc: '端末に紐づかないプロセスも表示' },
+            { opt: '--sort=-%mem', desc: 'メモリ使用率降順' }
+          ],
+          ex: '$ ps aux --sort=-%mem | head -15\nUSER         PID %CPU %MEM    VSZ   RSS COMMAND\nroot           1  0.0  0.3  21840 12488 /sbin/init\nroot          44  0.0  0.4  66820 16568 systemd-journald' },
+        { cmd: 'cat /proc/meminfo | grep -E "MemTotal|MemFree|MemAvailable"', desc: 'MemAvailableを確認し、実際に新しいプロセスが使用可能なメモリ量を正確に把握。freeコマンドより詳細な情報が得られる', 
+          options: [
+            { opt: '(オプションなし)', desc: '通常の grep 動作' },
+            { opt: '-E', desc: '拡張正規表現を使用' },
+            { opt: '-i', desc: '大文字小文字を区別しない' },
+            { opt: '-v', desc: 'マッチしない行を表示' },
+            { opt: '-c', desc: 'マッチした行数を表示' }
+          ],
+          ex: '$ cat /proc/meminfo | grep -E "MemTotal|MemFree"\nMemTotal:        3681004 kB\nMemFree:         2003464 kB\nMemAvailable:    2152032 kB' }
+      ]},
+      { title: 'スワップ', cat: 'スワップ使用率', cmds: [
+        { cmd: 'free -h | grep Swap', desc: 'スワップ使用状況を確認し、メモリ不足の兆候を検出。スワップ使用中はディスクI/Oによりパフォーマンスが大幅に低下する', 
+          options: [
+            { opt: '(オプションなし)', desc: 'キロバイト単位で表示' },
+            { opt: '-h', desc: '人間が読みやすい形式' },
+            { opt: 'grep Swap', desc: 'Swap行のみ抽出' },
+            { opt: 'grep -v Swap', desc: 'Swap以外を表示' }
+          ],
+          ex: '$ free -h | grep Swap\nSwap:          2.0Gi       512Mi       1.5Gi' },
+        { cmd: 'swapon --show', desc: 'スワップとして使用されているデバイス/ファイルを確認し、スワップ領域の拡張や設定変更を検討', 
+          options: [
+            { opt: '(オプションなし)', desc: '簡易フォーマットで表示' },
+            { opt: '--show', desc: 'スワップデバイス情報を表示' },
+            { opt: '--summary', desc: 'スワップ使用状況のサマリ' },
+            { opt: '-s', desc: '--summaryの短縮形' }
+          ],
+          ex: '$ swapon --show\nNAME       TYPE SIZE  USED PRIO\n/swapfile  file  2G   512M   -2' },
+        { cmd: 'vmstat 1 5', desc: 'スワップイン(si)とスワップアウト(so)を監視し、実際にスワッピングが発生しているかを判断。継続的なスワッピングはパフォーマンス劣化の兆候', 
+          options: [
+            { opt: '(オプションなし)', desc: '1回のみ統計表示' },
+            { opt: '1', desc: '更新間隔(秒)' },
+            { opt: '5', desc: '更新回数' },
+            { opt: '-a', desc: 'アクティブ/非アクティブメモリを表示' },
+            { opt: '-s', desc: 'メモリ統計を表示' }
+          ],
+          ex: '$ vmstat 1 3\nprocs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st\n 1  0      0 1957888  51200 171520    0    0     5    12   45   89  1  0 99  0  0\n 0  0      0 1957456  51200 171520    0    0     0     4   38   76  0  0 100 0  0' }
+      ]},
+      { title: 'ネットワーク', cat: 'NW送受信バイト数', cmds: [
+        { cmd: 'ip -s link show', desc: 'ネットワークインターフェースのエラーやドロップパケットを確認し、ネットワーク障害やハードウェア問題を検出', 
+          options: [
+            { opt: '(オプションなし)', desc: '基本的なlink情報のみ' },
+            { opt: '-s', desc: '統計情報を表示' },
+            { opt: 'link', desc: 'ネットワークデバイス情報' },
+            { opt: 'addr', desc: 'IPアドレス情報' },
+            { opt: 'route', desc: 'ルーティングテーブル情報' }
+          ],
+          ex: '$ ip -s link show\n2: eth0: <BROADCAST,MULTICAST,UP>\n    RX: bytes packets\n    987654321 1234567' },
+        { cmd: 'ip addr show', desc: 'サーバーに割り当てられているIPアドレスやネットワーク設定を確認し、接続問題のトラブルシューティングを実施', 
+          options: [
+            { opt: '(オプションなし)', desc: '全インターフェースの情報' },
+            { opt: 'addr', desc: 'IPアドレス情報' },
+            { opt: 'show', desc: '情報を表示' },
+            { opt: 'show eth0', desc: '特定インターフェースのみ' },
+            { opt: '-4', desc: 'IPv4のみ表示' },
+            { opt: '-6', desc: 'IPv6のみ表示' }
+          ],
+          ex: '$ ip addr show\n2: eth0: <BROADCAST,MULTICAST,UP>\n    inet 172.31.10.100/20' },
+        { cmd: 'sar -n DEV 1 5', desc: 'ネットワーク帯域の使用状況を時系列で観察し、帯域飽和やトラフィック急増を検出。DDoS攻撃の検知にも有効', 
+          options: [
+            { opt: '(オプションなし)', desc: '全サンプルのCPU統計' },
+            { opt: '-n DEV', desc: 'ネットワークデバイス統計' },
+            { opt: '-n EDEV', desc: 'ネットワークエラー統計' },
+            { opt: '-n IP', desc: 'IPトラフィック統計' },
+            { opt: '1 5', desc: '1秒間隔5回サンプリング' }
+          ],
+          ex: '$ sar -n DEV 1 3\nLinux 6.6.87.2-microsoft-standard-WSL2 (linux-server)        02/07/26        _x86_64_        (6 CPU)\n19:01:51        IFACE   rxpck/s   txpck/s    rxkB/s    txkB/s   rxcmp/s   txcmp/s  rxmcst/s   %ifutil\n19:01:52           lo     19.00     19.00      2.41      2.41      0.00      0.00      0.00      0.00\n19:01:52         eth0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00\n19:01:52      docker0      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00' },
+        { cmd: 'ss -s', desc: '接続数やソケット状態の概要を把握し、接続リークやリソース枯渇を早期に発見', 
+          options: [
+            { opt: '(オプションなし)', desc: 'ソケット詳細情報' },
+            { opt: '-s', desc: 'ソケット統計サマリを表示' },
+            { opt: '-a', desc: '全ソケットを表示' },
+            { opt: '-e', desc: '詳細情報を追加' },
+            { opt: '-m', desc: 'メモリ使用情報を表示' }
+          ],
+          ex: '$ ss -s\nTotal: 256\nTCP: 89 (estab 45)' }
+      ]},
+      { title: 'ディスク使用', cat: 'FS使用率/使用量/容量', cmds: [
+        { cmd: 'df -h', desc: 'ディスク容量不足によるアプリケーション障害やログ出力停止を防ぐ。各パーティションの使用率を監視し、容量拡張やクリーンアップの必要性を判断', 
+          options: [
+            { opt: '(オプションなし)', desc: 'キロバイト単位でブロック数表示' },
+            { opt: '-h', desc: '人間が読みやすいサイズ(KB/MB/GB)' },
+            { opt: '-i', desc: 'inode使用状況を表示' },
+            { opt: '-T', desc: 'ファイルシステムタイプを表示' },
+            { opt: '-t TYPE', desc: '特定タイプのみ表示' }
+          ],
+          ex: `$ df -h\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/sdd       1007G   ${Math.round(diskRoot*10)}G  ${1007-Math.round(diskRoot*10)}G   ${diskRoot}% /` },
+        { cmd: 'df -i', desc: 'inode枯渇を検出。小さなファイルが大量にあるとinode不足で新規ファイル作成ができなくなる。容量が空いていてもinode不足でエラーになることがある', 
+          options: [
+            { opt: '(オプションなし)', desc: 'ブロック数で表示' },
+            { opt: '-i', desc: 'inode情報を表示' },
+            { opt: '-h', desc: '人間が読みやすい形式' },
+            { opt: '-T', desc: 'ファイルシステムタイプも表示' },
+            { opt: '-P', desc: 'POSIX形式で出力' }
+          ],
+          ex: '$ df -i\nFilesystem       Inodes   IUsed    IFree IUse% Mounted on\n/dev/sdd       67108864  519390 66589474    1% /' },
+        { cmd: 'du -sh /* 2>/dev/null | sort -rh | head -10', desc: '容量を消費しているディレクトリを特定し、不要なファイルの削除やログローテーション設定を見直す', 
+          options: [
+            { opt: '(オプションなし)', desc: '全サブディレクトリのサイズを再帰的に表示' },
+            { opt: '-s', desc: '合計のみ表示(サブディレクトリを展開しない)' },
+            { opt: '-h', desc: '人間が読みやすいサイズ' },
+            { opt: '-a', desc: 'ディレクトリだけでなくファイルも表示' },
+            { opt: '--max-depth=N', desc: '指定階層までのみ表示' }
+          ],
+          ex: '$ du -sh /*\n25G /var\n12G /usr\n8.5G /home' },
+        { cmd: 'find / -type f -size +100M 2>/dev/null | head -20', desc: '巨大なログファイルやダンプファイルを発見し、削除や圧縮の対象を特定。予期しない大容量ファイルがディスクを圧迫していないか確認', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ファイルとディレクトリを検索' },
+            { opt: '-type f', desc: '通常ファイルのみ検索' },
+            { opt: '-size +100M', desc: '100MB超のファイル' },
+            { opt: '-mtime +N', desc: 'N日以上更新されていない' },
+            { opt: '-name PATTERN', desc: 'ファイル名パターン検索' }
+          ],
+          ex: '$ find / -type f -size +100M\n/var/log/messages 2.5G' },
+      ]},
+      { title: 'ディスクI/O', cat: 'ディスクI/O', cmds: [
+        { cmd: 'iostat -x 1 5', desc: 'ディスクI/Oがボトルネックになっているかを診断。await(応答時間)や%util(使用率)が高い場合、ディスクが性能限界に達している可能性がある', 
+          options: [
+            { opt: '(オプションなし)', desc: 'CPU統計とデバイス統計を表示' },
+            { opt: '-x', desc: '拡張統計情報を表示' },
+            { opt: '-c', desc: 'CPU統計も表示' },
+            { opt: '-d', desc: 'デバイス利用統計のみ' },
+            { opt: '1 5', desc: '1秒間隔5回サンプリング' }
+          ],
+          ex: '$ iostat -x 1 3\navg-cpu:  %user   %nice %system %iowait  %steal   %idle\n           1.30    0.00    1.27    0.13    0.00   97.29\nDevice            r/s     rkB/s   rrqm/s  %rrqm r_await rareq-sz     w/s     wkB/s   wrqm/s  %wrqm w_await wareq-sz  aqu-sz  %util\nsdd              3.84    171.12     2.07  34.97    0.63    44.53    1.72    124.99     2.88  62.70   17.88    72.87    0.03   0.77' },
+        { cmd: 'sudo iotop -oPa -n 3', desc: 'ディスクI/Oを大量に発生させているプロセスを特定し、そのプロセスの最適化や設定変更を検討', 
+          options: [
+            { opt: '(オプションなし)', desc: '全プロセスのI/Oをリアルタイム表示' },
+            { opt: '-o', desc: 'I/Oを行っているプロセスのみ表示' },
+            { opt: '-P', desc: 'プロセス単位で表示(スレッドではなく)' },
+            { opt: '-a', desc: '累積I/Oを表示' },
+            { opt: '-n N', desc: 'N回更新後に終了' }
+          ],
+          ex: '$ sudo iotop -oPa -n 3\nTotal DISK READ: 125.50 M/s' },
+        { cmd: 'sar -d 1 5', desc: 'ディスクI/Oの時系列変化を記録し、パフォーマンス問題の傾向を分析。定期的なI/Oスパイクがあるか、継続的な高負荷かを判断できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'CPU統計を表示' },
+            { opt: '-d', desc: 'ディスクI/O統計を表示' },
+            { opt: '-p', desc: 'パーティション別に表示' },
+            { opt: '1', desc: '1秒間隔' },
+            { opt: '5', desc: '5回サンプリング' }
+          ],
+          ex: '$ sar -d 1 5\n15:23:45 DEV tps rd_sec/s wr_sec/s' }
+      ]},
+      { title: 'プロセス', cat: 'プロセス診断', cmds: [
+        { cmd: 'ps aux --sort=-%cpu | head -15', desc: 'システムリソースを大量消費しているプロセスを特定し、そのプロセスが正常か異常かを判断。予期しないプロセスの暴走を早期発見できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'プロセス起動順で表示' },
+            { opt: 'a', desc: '全ユーザーのプロセスを表示' },
+            { opt: 'u', desc: 'ユーザー向け詳細情報表示' },
+            { opt: 'x', desc: '端末に紐づかないプロセスも表示' },
+            { opt: '--sort=-%cpu', desc: 'CPU使用率降順でソート' },
+            { opt: '--sort=-%mem', desc: 'メモリ使用率降順でソート' }
+          ],
+          ex: '$ ps aux --sort=-%cpu | head -15\nUSER       PID %CPU %MEM    VSZ   RSS COMMAND\nroot       567 15.2  8.3 123456 67890 /usr/bin/dockerd\nroot      1234  2.1  1.2  45678 12345 /usr/sbin/sshd\nroot       890  1.5  0.8  34567  8901 /usr/sbin/rsyslogd' },
+        { cmd: 'ps -eo pid,ppid,cmd,%cpu,%mem --sort=-%cpu | head -20', desc: 'プロセスの親子関係を把握し、どのプロセスが原因で子プロセスが大量起動しているかを特定。プロセスツリー全体の負荷を理解できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '標準フォーマットでプロセス表示' },
+            { opt: '-e', desc: '全プロセスを表示' },
+            { opt: '-o FORMAT', desc: '出力フォーマットを指定' },
+            { opt: 'pid', desc: 'プロセスID' },
+            { opt: 'ppid', desc: '親プロセスID' },
+            { opt: '%cpu', desc: 'CPU使用率' }
+          ],
+          ex: '$ ps -eo pid,ppid,cmd,%cpu,%mem\n  PID  PPID CMD                  %CPU %MEM\n  567     1 /usr/bin/dockerd     15.2  8.3\n 1234     1 /usr/sbin/sshd        2.1  1.2\n  890     1 /usr/sbin/rsyslogd    1.5  0.8' },
+        { cmd: 'top -bn1 -o %CPU | head -20', desc: 'スクリプトやモニタリングツールでプロセス情報を定期的に取得し、異常を自動検知。対話モードでないため自動化しやすい', 
+          options: [
+            { opt: '(オプションなし)', desc: '対話モードで継続的に更新' },
+            { opt: '-b', desc: 'バッチモード' },
+            { opt: '-n1', desc: '1回だけ表示' },
+            { opt: '-o FIELD', desc: 'ソートフィールド指定' },
+            { opt: '%CPU', desc: 'CPU使用率でソート' },
+            { opt: '%MEM', desc: 'メモリ使用率でソート' }
+          ],
+          ex: '$ top -bn1 -o %CPU | head -20\ntop - 15:23:45 up 10 days' },
+        { cmd: 'pgrep -a sshd', desc: '特定のサービスが起動しているかを素早く確認。sshdやnginxなどの重要プロセスの起動状態をチェックできる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'PIDのみ表示' },
+            { opt: '-a', desc: 'プロセス名とコマンドラインを表示' },
+            { opt: '-l', desc: 'プロセス名も表示' },
+            { opt: '-u USER', desc: '特定ユーザーのプロセスのみ' },
+            { opt: '-x', desc: '完全一致するプロセス名' }
+          ],
+          ex: '$ pgrep -a sshd\n1234 /usr/sbin/sshd -D' },
+        { cmd: 'docker top <container>', desc: 'コンテナ内で実行中のプロセスを確認し、コンテナが期待通りに動作しているかを診断。コンテナ内プロセスの暴走も検出できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '標準psフォーマット' },
+            { opt: '<container>', desc: 'コンテナ名またはID' },
+            { opt: 'ps OPTIONS', desc: 'psコマンドのオプションを指定可能' },
+            { opt: '-eo pid,cmd', desc: '表示フォーマットをカスタマイズ' }
+          ],
+          ex: '$ docker top test-nginx\nUID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD\nroot                15093               15069               2                   19:01               ?                   00:00:00            nginx: master process nginx -g daemon off;\nmessage+            15168               15093               0                   19:01               ?                   00:00:00            nginx: worker process' }
+      ]},
+      { title: 'サービス', cat: 'サービスステータス診断', cmds: [
+        { cmd: 'systemctl status docker', desc: 'Dockerサービスが正常に動作しているかを確認し、コンテナが起動できない問題の原因を切り分ける。起動失敗時のエラーメッセージも表示される', 
+          options: [
+            { opt: '(オプションなし)', desc: 'サービス一覧を表示' },
+            { opt: 'status', desc: 'サービスの状態を表示' },
+            { opt: 'start', desc: 'サービスを起動' },
+            { opt: 'stop', desc: 'サービスを停止' },
+            { opt: 'restart', desc: 'サービスを再起動' },
+            { opt: 'enable', desc: '自動起動を有効化' }
+          ],
+          ex: '$ systemctl status docker\n● docker.service - Docker Application Container Engine\n     Loaded: loaded (/usr/lib/systemd/system/docker.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-02-07 19:00:52 JST; 9s ago' },
+        { cmd: 'systemctl status nginx', desc: 'Webサーバー(nginx)が正常に動作しているかを確認し、Webサイトにアクセスできない問題を診断。起動失敗時のエラーメッセージも表示される', 
+          options: [
+            { opt: 'status', desc: 'サービスの状態を表示' },
+            { opt: 'start', desc: 'サービスを起動' },
+            { opt: 'stop', desc: 'サービスを停止' },
+            { opt: 'restart', desc: 'サービスを再起動' },
+            { opt: 'reload', desc: '設定再読み込み' }
+          ],
+          ex: '$ systemctl status nginx\n● nginx.service - A high performance web server and a reverse proxy server\n     Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-02-07 18:58:28 JST; 13s ago' },
+        { cmd: 'systemctl status sshd', desc: 'SSH接続ができない問題を診断。sshdが停止していればサービスの起動を、設定エラーがあれば設定ファイルの修正を行う', 
+          options: [
+            { opt: 'status', desc: 'サービスの状態を表示' },
+            { opt: 'start', desc: 'サービスを起動' },
+            { opt: 'stop', desc: 'サービスを停止' },
+            { opt: 'restart', desc: 'サービスを再起動' }
+          ],
+          ex: '$ systemctl status sshd\n● sshd.service - OpenSSH Daemon\n   Active: active (running)' },
+        { cmd: 'systemctl status chronyd', desc: 'システム時刻がずれていないかを確認。時刻同期が止まっているとログのタイムスタンプが信頼できず、証明書検証エラーなども発生する', 
+          options: [
+            { opt: 'status', desc: 'サービスの状態を表示' },
+            { opt: 'start', desc: 'サービスを起動' },
+            { opt: 'stop', desc: 'サービスを停止' },
+            { opt: 'restart', desc: 'サービスを再起動' }
+          ],
+          ex: '$ systemctl status chronyd\n● chronyd.service - NTP client/server\n   Active: active (running)' },
+        { cmd: 'systemctl status rsyslog', desc: 'ログが正常に記録されているかを確認。rsyslogが停止しているとアプリケーションログやシステムログが失われる', 
+          options: [
+            { opt: 'status', desc: 'サービスの状態を表示' },
+            { opt: 'start', desc: 'サービスを起動' },
+            { opt: 'stop', desc: 'サービスを停止' },
+            { opt: 'restart', desc: 'サービスを再起動' }
+          ],
+          ex: '$ systemctl status rsyslog\n● rsyslog.service - System Logging Service\n   Active: active (running)' },
+        { cmd: 'systemctl list-units --type=service --state=failed', desc: '起動に失敗したサービスを一覧表示し、システムの問題を洗い出す。予期しないサービス障害を早期に発見できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '読み込まれた全ユニットを表示' },
+            { opt: '--type=service', desc: 'サービスユニットのみ表示' },
+            { opt: '--state=failed', desc: '失敗状態のみ表示' },
+            { opt: '--state=running', desc: '実行中のみ表示' },
+            { opt: '--all', desc: '全てのユニットを表示' }
+          ],
+          ex: '$ systemctl list-units --type=service --state=failed\nUNIT                    LOAD   ACTIVE SUB    DESCRIPTION\n(表示なし: 失敗したサービスが存在しない場合)' }
+      ]},
+      { title: 'ポート', cat: 'TCPポート接続状況', cmds: [
+        { cmd: 'ss -tuln', desc: 'サーバーがどのポートで待ち受けているかを確認し、意図しないポートの開放（セキュリティリスク）や必要なポートの未開放を検出', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ソケット情報を表示' },
+            { opt: '-t', desc: 'TCPソケットのみ表示' },
+            { opt: '-u', desc: 'UDPソケットのみ表示' },
+            { opt: '-l', desc: 'LISTEN状態のソケットのみ表示' },
+            { opt: '-n', desc: '名前解決をしない(高速化)' },
+            { opt: '-p', desc: 'プロセス情報を表示' }
+          ],
+          ex: '$ ss -tuln\nNetid State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port\ntcp   LISTEN 0      4096    127.0.0.53%lo:53        0.0.0.0:*\ntcp   LISTEN 0      511         127.0.0.1:39139      0.0.0.0:*\nudp   UNCONN 0      0          127.0.0.54:53         0.0.0.0:*' },
+        { cmd: 'lsof -i :80', desc: '特定ポート（例：Webサーバーの80番）を使用しているプロセスを特定し、ポート競合や不正なプロセスを検出', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ての開いているファイルを表示' },
+            { opt: '-i :PORT', desc: '特定ポートを使用しているプロセス' },
+            { opt: '-i TCP', desc: 'TCP接続のみ' },
+            { opt: '-i UDP', desc: 'UDP接続のみ' },
+            { opt: '-u USER', desc: '特定ユーザーのファイル' }
+          ],
+          ex: '$ lsof -i :80\nCOMMAND   PID     USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnginx   13323     root    5u  IPv4 187999      0t0  TCP *:http (LISTEN)\nnginx   13326 www-data    5u  IPv4 187999      0t0  TCP *:http (LISTEN)' },
+        { cmd: 'ss -tan state established | wc -l', desc: '確立済みの接続数をカウントし、サーバーの負荷や同時接続数の上限に達していないかを確認', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ソケット情報を表示' },
+            { opt: '-t', desc: 'TCPソケット' },
+            { opt: '-a', desc: '全ソケット' },
+            { opt: '-n', desc: '名前解決をしない' },
+            { opt: 'state established', desc: 'ESTABLISHED状態のみ' },
+            { opt: 'state closing', desc: 'CLOSING状態のみ' }
+          ],
+          ex: '$ ss -tan state established | wc -l\n456' },
+        { cmd: 'ss -tan | grep -c TIME-WAIT', desc: 'TIME_WAIT状態のソケット数をカウントし、ソケット枯渇や接続リソースの消費状況を把握。大量のTIME_WAITは設定チューニングが必要な場合がある', 
+          options: [
+            { opt: '-t', desc: 'TCPソケット' },
+            { opt: '-a', desc: '全ソケット' },
+            { opt: '-n', desc: '名前解決をしない' },
+            { opt: '-c', desc: 'マッチした行数を表示' },
+            { opt: 'TIME-WAIT', desc: 'TIME-WAIT状態のソケットを検索' }
+          ],
+          ex: '$ ss -tan | grep -c TIME-WAIT\n3456' }
+      ]},
+      { title: 'システムログ', cat: 'テキストログ診断', cmds: [
+        { cmd: 'tail -f /var/log/messages', desc: 'システムログをリアルタイムで監視し、発生したばかりのエラーや警告を即座に発見。トラブルシューティング中に問題の発生タイミングを把握できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '最後10行を表示' },
+            { opt: '-f', desc: 'ファイルの追加をリアルタイムで表示' },
+            { opt: '-n N', desc: '最後N行を表示' },
+            { opt: '-c N', desc: '最後Nバイトを表示' },
+            { opt: '--pid=PID', desc: 'PIDが終了したらtailも終了' }
+          ],
+          ex: '$ tail -f /var/log/messages\nJan 24 15:23:45 server kernel: ...' },
+        { cmd: 'tail -f /var/log/secure', desc: 'SSHログイン試行や認証失敗をリアルタイムで監視し、不正アクセスやブルートフォース攻撃を検出', 
+          options: [
+            { opt: '(オプションなし)', desc: '最後10行を表示' },
+            { opt: '-f', desc: 'リアルタイムで追尾' },
+            { opt: '-n N', desc: '最後N行を表示' },
+            { opt: '-F', desc: 'ファイル名で追尾(ローテート対応)' }
+          ],
+          ex: '$ tail -f /var/log/secure\nJan 24 15:23:45 server sshd[12345]: Accepted publickey for user from 192.168.1.100' },
+        { cmd: 'journalctl -f', desc: 'systemd管理下の全サービスのログを統合的にリアルタイム監視し、複数のログファイルを開く手間を省いてシステム全体の状態を把握', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ログを時系列で表示' },
+            { opt: '-f', desc: 'リアルタイムでログを追尾' },
+            { opt: '-u UNIT', desc: '特定ユニットのみ' },
+            { opt: '-b', desc: '現在の起動以降のみ' },
+            { opt: '-k', desc: 'カーネルメッセージのみ' }
+          ],
+          ex: '$ journalctl -f\nJan 24 15:23:45 server systemd[1]: Started session...' },
+        { cmd: 'journalctl -u docker -n 50 --no-pager', desc: 'Dockerサービスの最新ログを確認し、コンテナ起動失敗やエラーの原因を特定', 
+          options: [
+            { opt: '(オプションなし)', desc: 'ページャで全ログを表示' },
+            { opt: '-u UNIT', desc: '特定のsystemdユニットのログのみ表示' },
+            { opt: '-n N', desc: '最新N行のみ表示' },
+            { opt: '-f', desc: 'リアルタイムでログを追跡' },
+            { opt: '-p LEVEL', desc: '優先度レベル以上のログのみ(err, warning等)' },
+            { opt: '--no-pager', desc: 'ページャを使わず全て表示' }
+          ],
+          ex: '$ journalctl -u docker -n 50\nJan 24 15:20:30 server dockerd[567]: started container...' }
+      ]},
+      { title: 'イベントログ', cat: 'システムイベント診断', cmds: [
+        { cmd: 'dmesg -T | tail -50', desc: 'カーネルレベルのハードウェアエラー、ドライバー問題、OOM(Out of Memory)キラーの発動を確認。ハードウェア障害やメモリ不足が原因の問題を発見できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'Unix時刻でタイムスタンプ表示' },
+            { opt: '-T', desc: 'タイムスタンプを人間が読める形式で表示' },
+            { opt: '-l LEVEL', desc: '特定レベルのみ表示(err,warn等)' },
+            { opt: '-w', desc: '新しいメッセージを待つ' },
+            { opt: '-c', desc: '表示後にバッファをクリア' }
+          ],
+          ex: '$ dmesg -T | tail -50\n[Sat Feb  7 18:08:19 2026] mini_init (187): drop_caches: 1\n[Sat Feb  7 18:09:55 2026] mini_init (187): drop_caches: 1\n[Sat Feb  7 18:12:05 2026] mini_init (187): drop_caches: 1' },
+        { cmd: 'journalctl -b -p err --no-pager', desc: '最新起動以降のエラーレベルのログを抽出し、システムの問題を素早く把握。起動時のエラーやサービス起動失敗を発見できる', 
+          options: [
+            { opt: '(オプションなし)', desc: 'ページャで全ログを表示' },
+            { opt: '-b', desc: '現在の起動以降' },
+            { opt: '-p err', desc: 'エラーレベル以上' },
+            { opt: '-p warning', desc: '警告レベル以上' },
+            { opt: '--no-pager', desc: 'ページャを使わない' }
+          ],
+          ex: '$ journalctl -b -p err\nJan 24 10:15:30 server systemd[1]: Failed...' },
+        { cmd: 'last -x | head -30', desc: 'システムの予期しない再起動や不正なログイン履歴を確認し、セキュリティ上の問題や障害の突然の再起動を検知', 
+          options: [
+            { opt: '(オプションなし)', desc: 'ログイン/ログアウト履歴のみ' },
+            { opt: '-x', desc: 'システムシャットダウンと実行レベル変更も表示' },
+            { opt: '-n NUM', desc: '表示行数をNUMに制限' },
+            { opt: '-a', desc: 'ホスト名を最後のカラムに表示' },
+            { opt: '-d', desc: 'IPアドレスで表示' }
+          ],
+          ex: '$ last -x | head -30\nreboot system boot Fri Jan 24 10:15' }
+      ]},
+      { title: 'ファイル存在', cat: 'ファイル存在有無診断', cmds: [
+        { cmd: '[ -f /var/run/app.pid ] && echo "Running" || echo "Stopped"', desc: 'アプリケーションのPIDファイル存在を確認し、プロセスが起動中か停止中かを判断。スクリプトでサービスの状態を自動チェックするのに利用', 
+          options: [
+            { opt: '(オプションなし)', desc: 'testコマンドの標準動作' },
+            { opt: '-f FILE', desc: 'ファイルが存在するか確認' },
+            { opt: '-d DIR', desc: 'ディレクトリが存在するか確認' },
+            { opt: '-e FILE', desc: 'ファイル/ディレクトリが存在するか確認' },
+            { opt: '&&', desc: '前のコマンドが成功した場合のみ実行' },
+            { opt: '||', desc: '前のコマンドが失敗した場合のみ実行' }
+          ],
+          ex: '$ [ -f /var/run/app.pid ] && echo "Running"\nRunning' },
+        { cmd: 'find /var/log -name "*.log" -type f -mtime +30', desc: '長期間更新されていない古いログファイルを発見し、削除やアーカイブの対象を特定。ディスク容量の節約に役立つ', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ファイルとディレクトリを検索' },
+            { opt: '-name PATTERN', desc: 'ファイル名パターン検索' },
+            { opt: '-type f', desc: '通常ファイルのみ' },
+            { opt: '-mtime +N', desc: 'N日以上前に更新' },
+            { opt: '-mtime -N', desc: 'N日以内に更新' }
+          ],
+          ex: '$ find /var/log -name "*.log" -type f -mtime +30\n/var/log/old_app.log' }
+      ]},
+      { title: 'ファイルサイズ', cat: 'ファイルサイズ診断', cmds: [
+        { cmd: 'find /var/log -name "*.log" -size +500M', desc: '巨大ログファイルを発見し、ログローテーション設定の設定漏れや異常なログ出力を検出。放置するとディスク容量を圧迫する', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ファイルとディレクトリを検索' },
+            { opt: '-name PATTERN', desc: 'ファイル名パターン' },
+            { opt: '-size +500M', desc: '500MBより大きい' },
+            { opt: '-size -100M', desc: '100MBより小さい' },
+            { opt: '-size 1G', desc: 'ちょうど1GB' }
+          ],
+          ex: '$ find /var/log -name "*.log" -size +500M\n/var/log/nginx/access.log' },
+        { cmd: 'du -sh /var/log/* | sort -rh | head -10', desc: 'ログディレクトリ内で最もディスクを消費しているサブディレクトリを特定し、ログ管理の優先順位を決定', 
+          options: [
+            { opt: '(オプションなし)', desc: '全サブディレクトリのサイズを表示' },
+            { opt: '-s', desc: '合計のみ表示' },
+            { opt: '-h', desc: '人間が読みやすいサイズ' },
+            { opt: 'sort -rh', desc: '人間が読める形式で逆順ソート' },
+            { opt: 'head -10', desc: '最初の10行のみ表示' }
+          ],
+          ex: '$ du -sh /var/log/*\n12G /var/log/nginx\n4.5G /var/log/mysql' },
+        { cmd: 'stat -c "%n %s bytes" /var/log/messages', desc: 'ファイルサイズを正確にバイト単位で取得し、スクリプトでファイルサイズを判定。閾値を超えたらアラートを出すスクリプトに利用', 
+          options: [
+            { opt: '(オプションなし)', desc: '詳細なファイル情報を表示' },
+            { opt: '-c FORMAT', desc: 'カスタムフォーマットで出力' },
+            { opt: '%n', desc: 'ファイル名' },
+            { opt: '%s', desc: 'ファイルサイズ(バイト)' },
+            { opt: '%y', desc: '最終更新時刻' },
+            { opt: '%a', desc: 'アクセス権限' }
+          ],
+          ex: '$ stat -c "%n %s bytes" /var/log/messages\n/var/log/messages 524288000 bytes' }
+      ]},
+      { title: 'コマンド実行', cat: 'コマンド実行結果診断', cmds: [
+        { cmd: 'watch -n 2 "df -h"', desc: 'ディスク使用率を定期的に監視し、急激な変化や容量増加をリアルタイムで検知。ファイルコピー中やバックアップ中の進捗状況も確認できる', 
+          options: [
+            { opt: '(オプションなし)', desc: '2秒毎にコマンドを実行' },
+            { opt: '-n SEC', desc: 'SEC秒毎にコマンドを実行' },
+            { opt: '-d', desc: '変化があった箇所をハイライト' },
+            { opt: '-t', desc: 'ヘッダーを表示しない' },
+            { opt: '-b', desc: 'エラー時にビープ音' }
+          ],
+          ex: '$ watch -n 2 "df -h"\nEvery 2.0s: df -h' },
+        { cmd: 'timeout 30s mysqladmin ping', desc: 'データベース接続チェックがハングしないようにタイムアウトを設定し、スクリプトが無限待機するのを防ぐ。ヘルスチェックで使用', 
+          options: [
+            { opt: '(オプションなし)', desc: 'タイムアウトなしで実行' },
+            { opt: '30s', desc: '30秒でタイムアウト' },
+            { opt: '-k DURATION', desc: '強制終了までの待機時間' },
+            { opt: '-s SIGNAL', desc: '送信するシグナルを指定' },
+            { opt: '--preserve-status', desc: 'コマンドの終了ステータスを保持' }
+          ],
+          ex: '$ timeout 30s mysqladmin ping\nmysqld is alive' }
+      ]},
+      { title: 'Web', cat: 'URL応答確認', cmds: [
+        { cmd: 'curl -o /dev/null -s -w "HTTP: %{http_code}, Time: %{time_total}s\\n" https://example.com', desc: 'Webサイトの応答速度やHTTPステータスコードを計測し、パフォーマンス問題やエラーを検知。定期監視やヘルスチェックに利用', 
+          options: [
+            { opt: '(オプションなし)', desc: 'コンテンツを標準出力に表示' },
+            { opt: '-o FILE', desc: '出力をファイルに保存' },
+            { opt: '-s', desc: 'サイレントモード(進行状況非表示)' },
+            { opt: '-w FORMAT', desc: 'カスタム出力フォーマット' },
+            { opt: '-I', desc: 'HTTPヘッダーのみ取得' },
+            { opt: '-L', desc: 'リダイレクトを追従' }
+          ],
+          ex: '$ curl -o /dev/null -s -w "HTTP: %{http_code}, Time: %{time_total}s\\n" https://example.com\nHTTP: 200, Time: 0.523s' },
+        { cmd: 'curl -I -s https://example.com | grep -E "HTTP|Server"', desc: 'Webサーバーの種類やバージョンを確認し、既知の脆弱性が存在しないかをチェック。セキュリティ診断やサーバー情報収集に利用', 
+          options: [
+            { opt: '(オプションなし)', desc: 'GETメソッドでコンテンツ取得' },
+            { opt: '-I', desc: 'HTTPヘッダーのみ取得(HEADメソッド)' },
+            { opt: '-s', desc: 'サイレントモード' },
+            { opt: '-v', desc: '詳細出力' },
+            { opt: '-X METHOD', desc: 'HTTPメソッドを指定' }
+          ],
+          ex: '$ curl -I -s https://example.com\nHTTP/2 200\nserver: nginx/1.24.0' }
+      ]},
+      { title: 'Docker', cat: 'コンテナ/イメージ診断', cmds: [
+        { cmd: 'docker ps', desc: '現在実行中のコンテナを一覧表示し、期待するコンテナが起動しているか、予期しないコンテナが存在しないかを確認', 
+          options: [
+            { opt: '(オプションなし)', desc: '実行中のコンテナのみ表示' },
+            { opt: '-a', desc: '停止中を含む全コンテナを表示' },
+            { opt: '-q', desc: 'コンテナIDのみ表示' },
+            { opt: '-s', desc: 'サイズ情報を追加表示' },
+            { opt: '--format', desc: '出力フォーマットを指定' }
+          ],
+          ex: '$ docker ps\nCONTAINER ID   IMAGE          COMMAND                  CREATED         STATUS         PORTS                                     NAMES\n5eed54aa8740   nginx:latest   "/docker-entrypoint.…"   9 seconds ago   Up 6 seconds   0.0.0.0:8888->80/tcp, [::]:8888->80/tcp   test-nginx' },
+        { cmd: 'docker ps -a', desc: '停止中のコンテナも含めて全て表示し、繰り返し起動失敗しているコンテナや削除候補を発見', 
+          options: [
+            { opt: '-a', desc: '全コンテナ(停止中含む)' },
+            { opt: '-q', desc: 'コンテナIDのみ' },
+            { opt: '-l', desc: '最後に作成されたコンテナ' },
+            { opt: '-n NUM', desc: '最後NUM個のコンテナ' }
+          ],
+          ex: '$ docker ps -a\nCONTAINER ID   IMAGE          COMMAND                  CREATED         STATUS         PORTS                                     NAMES\n5eed54aa8740   nginx:latest   "/docker-entrypoint.…"   9 seconds ago   Up 6 seconds   0.0.0.0:8888->80/tcp, [::]:8888->80/tcp   test-nginx' },
+        { cmd: 'docker stats --no-stream', desc: '各コンテナのCPUやメモリ使用状況を確認し、リソースを大量消費しているコンテナを特定して最適化やスケール調整を実施', 
+          options: [
+            { opt: '(オプションなし)', desc: '継続的にリアルタイム表示' },
+            { opt: '--no-stream', desc: '1回だけ表示して終了' },
+            { opt: '--format', desc: '出力フォーマットを指定' },
+            { opt: '-a', desc: '全コンテナ(停止中含む)' },
+            { opt: '--no-trunc', desc: '出力を省略しない' }
+          ],
+          ex: '$ docker stats --no-stream\nCONTAINER ID   NAME        CPU %     MEM USAGE / LIMIT     MEM %     NET I/O     BLOCK I/O\n5eed54aa8740   test-nginx  0.00%     5.2MiB / 3.5GiB       0.14%     656B / 0B   0B / 0B' },
+        { cmd: 'docker logs --tail 50 <container>', desc: 'コンテナ内アプリケーションのエラーや例外を確認し、コンテナが正常に動作していない原因を調査', 
+          options: [
+            { opt: '(オプションなし)', desc: '全ログを表示' },
+            { opt: '--tail N', desc: '最後N行を表示' },
+            { opt: '-f', desc: 'リアルタイムでログを追尾' },
+            { opt: '--since TIME', desc: '指定時刻以降のログ' },
+            { opt: '-t', desc: 'タイムステンプを表示' }
+          ],
+          ex: '$ docker logs --tail 10 test-nginx\n2026/02/07 10:01:36 [notice] 1#1: built by gcc 14.2.0 (Debian 14.2.0-19)\n2026/02/07 10:01:36 [notice] 1#1: OS: Linux 6.6.87.2-microsoft-standard-WSL2\n2026/02/07 10:01:36 [notice] 1#1: getrlimit(RLIMIT_NOFILE): 1048576:1048576\n2026/02/07 10:01:36 [notice] 1#1: start worker processes\n2026/02/07 10:01:36 [notice] 1#1: start worker process 29' },
+        { cmd: 'docker inspect <container> | grep -E "IPAddress|Memory"', desc: 'コンテナのIPアドレスやメモリ制限を確認し、ネットワーク問題の調査やリソース設定を見直す', 
+          options: [
+            { opt: '(オプションなし)', desc: '全情報をJSON形式で表示' },
+            { opt: '-f FORMAT', desc: 'Goテンプレートで出力フォーマット指定' },
+            { opt: '--type container', desc: 'コンテナ情報のみ' },
+            { opt: '--type image', desc: 'イメージ情報のみ' },
+            { opt: '-s', desc: 'サイズ情報も表示' }
+          ],
+          ex: '$ docker inspect web | grep IPAddress\n"IPAddress": "172.17.0.2"' },
+        { cmd: 'docker images', desc: 'ローカルに保存されているイメージ一覧を表示し、古いイメージや不要なイメージを特定してディスク容量を節約', 
+          options: [
+            { opt: '(オプションなし)', desc: '全イメージを表示' },
+            { opt: '-a', desc: '中間イメージも表示' },
+            { opt: '-q', desc: 'イメージIDのみ表示' },
+            { opt: '--digests', desc: 'ダイジェストも表示' },
+            { opt: '--filter', desc: 'フィルタ条件で絞り込み' }
+          ],
+          ex: '$ docker images\nREPOSITORY   TAG       IMAGE ID       CREATED        SIZE\nnginx        latest    c0e56a58f0d0   5 days ago     192MB' },
+        { cmd: 'docker system df', desc: 'Dockerが消費しているディスク容量を確認し、不要なイメージやボリューム、キャッシュを削除してディスク容量を解放', 
+          options: [
+            { opt: '(オプションなし)', desc: 'サマリ情報を表示' },
+            { opt: '-v', desc: '詳細情報を表示' },
+            { opt: '--format', desc: '出力フォーマットを指定' }
+          ],
+          ex: '$ docker system df\nTYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\nImages          15        5         2.5GB     1.2GB (48%)\nContainers      8         3         125MB     50MB (40%)' }
+      ]}
+    ];
+
+    // ========================================
+    // UIコンポーネント生成関数
+    // ========================================
+    
+    // セクションボックス生成
+    function section(title, bg, content, customClass = '') {
+      return `
+        <div class="border-2 border-indigo-500 rounded-lg p-2 ${bg} ${customClass} flex flex-col">
+          <div class="font-bold text-indigo-600 text-xs text-center pb-2 mb-2 border-b border-indigo-400">${title}</div>
+          ${content}
+        </div>
+      `;
+    }
+
+    // ボタン生成
+    function btn(item, idx) {
+      return `
+        <button onclick="show(${idx})" 
+          class="btn bg-gradient-to-br from-white to-blue-50 border-2 border-indigo-500 rounded-md px-2.5 py-1.5 
+                 text-xs font-semibold whitespace-nowrap shadow-md hover:shadow-lg hover:-translate-y-0.5 
+                 transition-all duration-300 hover:from-blue-50 hover:to-blue-100 active:from-indigo-500 
+                 active:to-purple-600 active:text-white active:scale-105">
+          ${item.title}
+        </button>
+      `;
+    }
+
+    // CPUバー生成
+    function cpuBar(core, percent) {
+      const getColorClass = (p) => 
+        p > THRESHOLDS.DISK_DANGER ? 'bg-red-500' : 
+        p > THRESHOLDS.DISK_WARNING ? 'bg-orange-500' : 'bg-green-500';
+      
+      return `
+        <div class="mb-3">
+          <div class="flex justify-between text-xs text-slate-700 font-semibold mb-1">
+            <span>Core ${core}</span><span id="cpu${core}-label">${percent}%</span>
+          </div>
+          <div class="w-full h-5 bg-slate-200 rounded-full overflow-hidden border-2 border-slate-300 shadow-inner relative">
+            <div id="cpu${core}-bar" class="h-full ${getColorClass(percent)} relative transition-all duration-700 ease-in-out" style="width: ${percent}%">
+              <div class="absolute top-0 right-0 w-1/3 h-full bg-gradient-to-l from-white/40 via-white/20 to-transparent"></div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // ネットワークパイプ生成
+    function netPipe(label, color, delay = 0) {
+      return `
+        <div class="flex items-center gap-2 mb-2">
+          <div class="text-xs font-bold text-${color}-900 min-w-[40px]">${label}</div>
+          <div class="flex-1 h-4 bg-gradient-to-b from-${color}-400 to-${color}-600 rounded-full border-3 border-${color}-800 shadow-md overflow-hidden relative">
+            <div class="absolute top-0.5 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-white/40 to-transparent rounded-full"></div>
+            <div class="absolute top-0 -left-8 w-8 h-full bg-gradient-to-r from-${color}-200 via-white/90 to-${color}-200 rounded-full shadow-lg animate-flow" style="animation-delay: ${delay}s"></div>
+            <div class="absolute top-0 -left-8 w-4 h-full bg-gradient-to-r from-transparent via-white/60 to-transparent animate-flow" style="animation-delay: ${delay + 0.5}s"></div>
+          </div>
+          <div class="w-2 h-2 bg-${color}-400 rounded-full animate-blink shadow-lg" style="animation-delay: ${delay}s"></div>
+        </div>
+      `;
+    }
+
+    // ディスク使用状況表示
+    function disk(label, percent, totalGB = 100) {
+      const usedGB = (totalGB * percent / 100).toFixed(1);
+      const getTextColor = (p) => 
+        p > THRESHOLDS.DISK_DANGER ? 'text-red-600' : 
+        p > THRESHOLDS.DISK_WARNING ? 'text-orange-600' : 'text-slate-700';
+      
+      return `
+        <div class="flex items-center gap-1 text-[0.65rem] ${getTextColor(percent)} font-mono">
+          <span class="font-semibold">${label}</span>
+          <span class="text-slate-600 ml-auto">${usedGB}GB</span>
+        </div>
+      `;
+    }
+
+    // ========================================
+    // ダイアグラム描画
+    // ========================================
+    function renderDiagram() {
+      document.getElementById('diagram').innerHTML = `
+        ${section('Web/アプリケーション', 'bg-yellow-100', `
+          <div class="flex flex-col items-center gap-3 flex-1 justify-start">
+            <div class="relative mt-4">
+              <div class="border-2 border-dashed border-cyan-600 rounded-lg bg-cyan-50/40 p-4">
+                <div class="absolute -top-3.5 left-1/2 -translate-x-1/2 bg-yellow-100 px-3 py-1 text-[0.6rem] font-bold text-cyan-700 border-2 border-cyan-500 rounded-md shadow-md whitespace-nowrap">🐳 Docker Container</div>
+                <div class="flex gap-2 items-center">
+                  <div class="flex flex-col items-center">
+                    <div class="w-14 h-10 bg-gradient-to-br from-green-600 to-green-700 rounded border-2 border-green-900 shadow-lg relative overflow-hidden">
+                      <div class="absolute top-1 left-1/2 -translate-x-1/2 text-[0.5rem] font-bold text-white">nginx</div>
+                      <div class="absolute bottom-1 left-1 right-1 flex gap-0.5">
+                        <div class="flex-1 h-1 bg-green-300 animate-pulse" style="animation-delay: 0s"></div>
+                        <div class="flex-1 h-1 bg-green-300 animate-pulse" style="animation-delay: 0.2s"></div>
+                        <div class="flex-1 h-1 bg-green-300 animate-pulse" style="animation-delay: 0.4s"></div>
+                      </div>
+                    </div>
+                    <div class="text-[0.5rem] text-green-900 font-bold mt-0.5">Web</div>
+                  </div>
+                  <div class="text-slate-400 text-lg">→</div>
+                  <div class="flex flex-col items-center">
+                    <div class="w-14 h-10 bg-gradient-to-br from-red-600 to-red-700 rounded border-2 border-red-900 shadow-lg relative overflow-hidden">
+                      <div class="absolute top-1 left-1/2 -translate-x-1/2 text-[0.5rem] font-bold text-white">Rails</div>
+                      <div class="absolute bottom-1 left-1 right-1 flex gap-0.5">
+                        <div class="flex-1 h-1 bg-red-300 animate-pulse" style="animation-delay: 0.3s"></div>
+                        <div class="flex-1 h-1 bg-red-300 animate-pulse" style="animation-delay: 0.5s"></div>
+                        <div class="flex-1 h-1 bg-red-300 animate-pulse" style="animation-delay: 0.7s"></div>
+                      </div>
+                      <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-0.5 bg-red-300/60 animate-flow" style="animation-duration: 2s"></div>
+                    </div>
+                    <div class="text-[0.5rem] text-red-900 font-bold mt-0.5">App</div>
+                  </div>
+                  <div class="text-slate-400 text-lg">→</div>
+                  <div class="flex flex-col items-center">
+                    <div class="w-14 h-10 bg-gradient-to-br from-blue-700 to-blue-900 rounded border-2 border-blue-900 shadow-lg relative overflow-hidden">
+                      <div class="absolute top-1 left-1/2 -translate-x-1/2 text-[0.5rem] font-bold text-white">MySQL</div>
+                      <div class="absolute bottom-1 left-1 right-1 flex gap-0.5 px-0.5">
+                        <div class="flex-1 h-1 bg-blue-300 rounded-sm animate-pulse" style="animation-delay: 0.6s"></div>
+                        <div class="flex-1 h-1 bg-blue-300 rounded-sm animate-pulse" style="animation-delay: 0.8s"></div>
+                        <div class="flex-1 h-1 bg-blue-300 rounded-sm animate-pulse" style="animation-delay: 1s"></div>
+                      </div>
+                      <div class="absolute top-1/2 left-0 right-0 h-0.5 bg-gradient-to-r from-transparent via-blue-300/60 to-transparent animate-flow" style="animation-duration: 2.5s"></div>
+                    </div>
+                    <div class="text-[0.5rem] text-blue-900 font-bold mt-0.5">DB</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2 justify-center">${btn(data[15], 15)} ${btn(data[16], 16)}</div>
+          </div>
+        `, 'flex-1 basis-full min-w-[200px]')}  
+        
+        ${section('ポート/接続', 'bg-gray-100', `
+          <div class="flex flex-col gap-1.5 flex-1 justify-start px-1">
+            ${netPipe(':22', 'sky', 0.1)}
+            ${netPipe(':80', 'green', 0.6)}
+            ${netPipe(':443', 'teal', 1.1)}
+            <div class="flex flex-wrap gap-2 justify-center mt-2">${btn(data[9], 9)}</div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(23%-0.625rem)] min-w-[140px]')}
+        
+        ${section('ホストOS', 'bg-orange-100', `
+          <div class="flex flex-col gap-2 flex-1 justify-start">
+            <div class="flex gap-2 justify-center flex-wrap">
+              ${['dockerd','systemd','sshd','chronyd','rsyslog','journalctl'].map((s, i) => `
+                <div class="flex flex-col items-center">
+                  <div class="w-10 h-10 ${s==='rsyslog'?'bg-gradient-to-br from-orange-800 to-orange-900':s==='journalctl'?'bg-gradient-to-br from-green-800 to-green-900':s==='sshd'?'bg-gradient-to-br from-indigo-600 to-indigo-800':s==='chronyd'?'bg-gradient-to-br from-amber-600 to-amber-800':s==='dockerd'?'bg-gradient-to-br from-cyan-600 to-cyan-800':'bg-gradient-to-br from-purple-700 to-purple-900'} rounded-md border-2 border-slate-900 shadow-lg relative overflow-hidden">
+                    ${s==='rsyslog'||s==='journalctl'?`
+                      <div class="absolute top-2 left-1 right-1 h-0.5 bg-white/70 rounded"></div>
+                      <div class="absolute top-3.5 left-1 right-1.5 h-0.5 bg-white/60 rounded"></div>
+                      <div class="absolute top-5 left-1 right-2 h-0.5 bg-white/50 rounded"></div>
+                      <div class="absolute top-6.5 left-1 right-1 h-0.5 bg-white/40 rounded"></div>
+                      <div class="absolute top-8 left-1 right-2.5 h-0.5 bg-white/30 rounded"></div>
+                      <div class="absolute top-0 left-0 right-0 h-full bg-gradient-to-b from-white/30 via-transparent to-transparent animate-flow"></div>
+                    `:`
+                      <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-4 bg-white/20 border border-white/50 rounded flex items-center justify-center">
+                        <div class="text-[0.4rem] font-bold text-white">ON</div>
+                      </div>
+                      <div class="absolute top-1 right-1 w-1.5 h-1.5 bg-green-400 rounded-full animate-blink shadow-lg"></div>
+                    `}
+                  </div>
+                  <div class="text-[0.55rem] font-bold mt-0.5 ${s==='rsyslog'?'text-orange-900':s==='journalctl'?'text-green-900':s==='sshd'?'text-indigo-900':s==='chronyd'?'text-amber-900':s==='dockerd'?'text-cyan-900':'text-purple-900'}">${s}</div>
+                </div>
+              `).join('')}
+            </div>
+            <div class="flex flex-wrap gap-2 justify-center">${[7,8,10,11].map(i => btn(data[i], i)).join('')}</div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(42%-0.625rem)] min-w-[200px]')}
+        
+        ${section('CPU', 'bg-yellow-100', `
+          <div class="flex-1 flex flex-col justify-start px-1">
+            ${cpuBar(0, cpuCore0)}
+            ${cpuBar(1, cpuCore1)}
+            <div class="flex flex-wrap gap-2 justify-center mt-1">
+              <button onclick="show(0)" class="btn bg-gradient-to-br from-white to-blue-50 border-2 border-indigo-500 rounded-md px-2.5 py-1.5 text-xs font-semibold whitespace-nowrap shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 hover:from-blue-50 hover:to-blue-100 active:from-indigo-500 active:to-purple-600 active:text-white active:scale-105">CPU負荷</button>
+              ${btn(data[1], 1)}
+            </div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(30%-0.625rem)] min-w-[160px]')}
+        
+        ${section('ネットワーク', 'bg-blue-100', `
+          <div class="flex flex-col gap-2 flex-1 justify-start px-1">
+            ${netPipe('lo', 'purple', 0.3)}
+            ${netPipe('eth0', 'blue', 0.9)}
+            <div class="flex flex-wrap gap-2 justify-center mt-1">${btn(data[4], 4)}</div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(23%-0.625rem)] min-w-[140px]')}
+        
+        ${section('ディスク/ストレージ', 'bg-green-100', `
+          <div class="flex flex-col gap-2 flex-1 px-2 justify-start">
+            <div class="bg-white/50 rounded-md p-1.5 border border-slate-300">
+              <div class="text-[0.65rem] font-bold text-slate-600 mb-1 flex items-center gap-1">
+                <span>📁</span><span>FS</span>
+              </div>
+              <div class="grid grid-cols-2 gap-x-3 gap-y-0">
+                ${disk('/', diskRoot, 200)}
+                ${disk('/home', diskHome, 80)}
+                ${disk('/var/log', diskVarLog, 30)}
+                ${disk('/tmp', diskTmp, 10)}
+              </div>
+              <div class="flex items-center gap-1 text-xs text-amber-700 font-mono mt-1 pt-1 border-t border-slate-300">
+                <span>💾</span>
+                <span class="font-semibold text-[0.65rem]">Swap</span>
+                <span class="text-amber-700 ml-auto text-[0.65rem]">${(diskSwap * 0.02).toFixed(1)}GB</span>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2 justify-center">${[5,6,12,13,14].map(i => btn(data[i], i)).join('')}</div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(42%-0.625rem)] min-w-[200px]')}
+        
+        ${section('メモリ', 'bg-purple-100', `
+          <div class="flex flex-col items-center gap-2 flex-1 justify-start">
+            <div class="w-16 h-12 bg-gradient-to-br from-green-600 to-green-700 rounded-md border-2 border-green-900 shadow-lg relative overflow-hidden">
+              <div class="absolute top-1 left-1 right-1 h-3 bg-slate-800 rounded flex gap-0.5 p-0.5" id="mem-chips">
+                ${[1,2,3,4,5].map((_, i) => `<div class="flex-1 ${i < Math.ceil(memPercent / THRESHOLDS.MEMORY_CHIP_STEP) ? 'bg-amber-400' : 'bg-amber-400/30'} rounded-sm transition-all duration-700"></div>`).join('')}
+              </div>
+              <div class="absolute bottom-1 left-1.5 right-1.5 flex gap-1">
+                ${[1,2,3,4,5,6,7,8].map(() => '<div class="w-0.5 h-2 bg-slate-300 rounded-sm"></div>').join('')}
+              </div>
+              <div class="absolute top-5 left-1.5 right-0 h-6 flex flex-col gap-0.5 pr-1.5" id="mem-flow">
+                ${memPercent > THRESHOLDS.MEMORY_WARNING ? [1,2,3,4,5].map((_, i) => `<div class="h-0.5 bg-gradient-to-r from-transparent via-red-400 to-red-200 animate-flow" style="animation-delay: ${i*0.2}s; animation-duration: 1s"></div>`).join('') : [1,2,3].map((_, i) => `<div class="h-0.5 bg-gradient-to-r from-transparent via-purple-400 to-purple-200 animate-flow" style="animation-delay: ${i*0.3}s"></div>`).join('')}
+              </div>
+            </div>
+            <div class="text-xs text-green-900 font-bold" id="mem-label">RAM <span id="mem-used">${memUsed}</span>GB/${memTotal}GB (<span id="mem-percent">${memPercent}</span>%)</div>
+            <div class="flex flex-wrap gap-2 justify-center mt-1">${[2,3].map(i => btn(data[i], i)).join('')}</div>
+          </div>
+        `, 'flex-1 basis-full sm:basis-[calc(48%-0.5rem)] lg:basis-[calc(30%-0.625rem)] min-w-[160px]')}
+      `;
+    }
+
+    // ========================================
+    // パネル表示
+    // ========================================
+    function show(idx) {
+      const item = data[idx];
+      const panel = document.getElementById('panel');
+      
+      console.log('show() called with idx:', idx);
+      console.log('item:', item);
+      console.log('panel element:', panel);
+      
+      // アクティブなボタンのハイライト解除
+      document.querySelectorAll('.btn').forEach(b => 
+        b.classList.remove('from-indigo-500', 'to-purple-600', 'text-white')
+      );
+      
+      panel.innerHTML = `
+        <div class="mb-3 pb-2 border-b-2 border-indigo-500">
+          <h2 class="text-indigo-600 text-base sm:text-lg font-bold">${item.title} 診断</h2>
+          <p class="text-gray-400 text-xs">${item.cat}</p>
+        </div>
+        <div class="space-y-2">
+          ${item.cmds.map((c, i) => `
+            <div class="bg-gray-50 rounded-md p-2 sm:p-3 border-l-4 border-green-500 hover:bg-blue-50 transition-all">
+              <div class="flex justify-between items-start gap-2 mb-2">
+                <code class="text-green-700 font-bold text-xs sm:text-sm flex-1 break-all">$ ${esc(c.cmd)}</code>
+                <button onclick="copy('${esc(c.cmd)}', ${idx}, ${i})" id="copy_${idx}_${i}"
+                  class="bg-white border-2 border-slate-300 text-slate-700 px-1.5 sm:px-2 py-1 sm:py-1.5 rounded text-xs sm:text-sm font-bold hover:bg-slate-50 hover:border-slate-400 shrink-0 transition-all shadow-sm flex items-center gap-1">
+                  <svg class="w-3 h-3 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                  </svg>
+                </button>
+              </div>
+              <p class="text-gray-600 text-xs mb-2">${c.desc}</p>
+              ${c.options || c.ex ? `
+                <div class="mt-2">
+                  <button onclick="toggleDetails('${idx}_${i}')" id="detail_btn_${idx}_${i}"
+                    class="bg-indigo-50 border border-indigo-300 text-indigo-700 px-2 py-1 rounded text-xs hover:bg-indigo-100 transition-colors font-semibold">
+                    📋 詳細を表示
+                  </button>
+                  <div id="details_${idx}_${i}" class="hidden mt-2">
+                    ${c.options ? `
+                      <div class="p-2 bg-blue-50 border border-blue-200 rounded text-xs mb-2">
+                        <div class="font-bold text-blue-900 mb-1">📖 オプション詳細</div>
+                        <div class="overflow-x-auto">
+                          <table class="w-full text-xs">
+                            <thead><tr class="border-b border-blue-300"><th class="text-left py-1 px-1 sm:px-2 font-bold text-blue-900">オプション</th><th class="text-left py-1 px-1 sm:px-2 font-bold text-blue-900">説明</th></tr></thead>
+                            <tbody>${c.options.map(opt => `<tr class="border-b border-blue-100"><td class="py-1 px-1 sm:px-2 font-mono text-blue-700 whitespace-nowrap text-[0.7rem] sm:text-xs">${esc(opt.opt)}</td><td class="py-1 px-1 sm:px-2 text-gray-700 text-[0.7rem] sm:text-xs">${esc(opt.desc)}</td></tr>`).join('')}</tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ` : ''}
+                    ${c.ex ? `
+                      <div class="p-2 bg-gray-50 border border-gray-300 rounded text-xs">
+                        <div class="font-bold text-gray-900 mb-1">💡 実行例</div>
+                        <pre class="p-2 bg-gray-800 text-green-400 rounded text-xs overflow-x-auto whitespace-pre-wrap">${esc(c.ex)}</pre>
+                      </div>
+                    ` : ''}
+                  </div>
+                </div>
+              ` : ''}
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // ========================================
+    // インタラクション
+    // ========================================
+    
+    // 詳細表示トグル
+    function toggleDetails(id) {
+      const details = document.getElementById('details_' + id);
+      const btn = document.getElementById('detail_btn_' + id);
+      const isHidden = details.classList.contains('hidden');
+      
+      details.classList.toggle('hidden');
+      btn.textContent = isHidden ? '📋 詳細を閉じる' : '📋 詳細を表示';
+    }
+
+    // コマンドコピー
+    function copy(text, idx, i) {
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById(`copy_${idx}_${i}`);
+        const originalHTML = btn.innerHTML;
+        
+        // 成功表示
+        btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span class="text-xs">OK</span>';
+        btn.classList.add('bg-green-100', 'border-green-400', 'text-green-700');
+        btn.classList.remove('bg-white', 'border-slate-300', 'text-slate-700');
+        
+        // リセット
+        setTimeout(() => {
+          btn.innerHTML = originalHTML;
+          btn.classList.remove('bg-green-100', 'border-green-400', 'text-green-700');
+          btn.classList.add('bg-white', 'border-slate-300', 'text-slate-700');
+        }, ANIMATION.COPY_BUTTON_RESET_MS);
+      });
+    }
+
+    // HTMLエスケープ
+    function esc(text) {
+      const escapeMap = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+        '`': '&#96;'
+      };
+      return text.replace(/[&<>"'`]/g, m => escapeMap[m]);
+    }
+
+    // ========================================
+    // 初期化・アニメーション
+    // ========================================
+    renderDiagram();
+
+    // リアルタイムCPU/メモリ使用率アニメーション
+    let currentCpu0 = cpuCore0;
+    let currentCpu1 = cpuCore1;
+    let currentMemPercent = memPercent;
+    
+    setInterval(() => {
+      // CPU Core 0のランダム変動
+      updateCpuCore(0, currentCpu0 = updateValue(currentCpu0));
+      
+      // CPU Core 1のランダム変動
+      updateCpuCore(1, currentCpu1 = updateValue(currentCpu1));
+
+      // メモリのランダム変動
+      currentMemPercent = updateValue(currentMemPercent);
+      updateMemory(currentMemPercent);
+    }, ANIMATION.UPDATE_INTERVAL_MS);
+
+    // 値のランダム更新
+    function updateValue(current, min = 20, max = 95, delta = 15) {
+      return Math.max(min, Math.min(max, current + rand(-delta, delta)));
+    }
+
+    // CPUコア表示更新
+    function updateCpuCore(core, percent) {
+      const bar = document.getElementById(`cpu${core}-bar`);
+      const label = document.getElementById(`cpu${core}-label`);
+      if (!bar || !label) return;
+      
+      bar.style.width = percent + '%';
+      label.textContent = Math.round(percent) + '%';
+      bar.className = bar.className.replace(/bg-(red|orange|green)-500/g, '');
+      
+      const colorClass = percent > THRESHOLDS.DISK_DANGER ? 'bg-red-500' : 
+                        percent > THRESHOLDS.DISK_WARNING ? 'bg-orange-500' : 'bg-green-500';
+      bar.className += ' ' + colorClass;
+    }
+
+    // メモリ表示更新
+    function updateMemory(percent) {
+      // パーセンテージとGB表示を更新
+      const memPercentEl = document.getElementById('mem-percent');
+      const memUsedEl = document.getElementById('mem-used');
+      if (memPercentEl) memPercentEl.textContent = Math.round(percent);
+      if (memUsedEl) memUsedEl.textContent = (memTotal * percent / 100).toFixed(1);
+      
+      // メモリチップ点灯状態を更新
+      const memChips = document.getElementById('mem-chips');
+      if (memChips) {
+        const activeChips = Math.ceil(percent / THRESHOLDS.MEMORY_CHIP_STEP);
+        Array.from(memChips.children).forEach((chip, i) => {
+          chip.className = `flex-1 bg-amber-400${i < activeChips ? '' : '/30'} rounded-sm transition-all duration-700`;
+        });
+      }
+
+      // メモリフロー色を更新
+      const memFlow = document.getElementById('mem-flow');
+      if (memFlow) {
+        const isHighUsage = percent > THRESHOLDS.MEMORY_WARNING;
+        memFlow.innerHTML = isHighUsage
+          ? [1,2,3,4,5].map((_, i) => `<div class="h-0.5 bg-gradient-to-r from-transparent via-red-400 to-red-200 animate-flow" style="animation-delay: ${i*0.2}s; animation-duration: 1s"></div>`).join('')
+          : [1,2,3].map((_, i) => `<div class="h-0.5 bg-gradient-to-r from-transparent via-purple-400 to-purple-200 animate-flow" style="animation-delay: ${i*0.3}s"></div>`).join('');
+      }
+    }
+  </script>
+</body>
+</html>
